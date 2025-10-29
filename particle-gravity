@@ -1,0 +1,77 @@
+# pip install thrml jax jaxlib
+import jax, jax.numpy as jnp
+from thrml import SpinNode, CategoricalNode, Block, SamplingSchedule, sample_states
+from thrml.models import IsingEBM, IsingSamplingProgram, hinton_init
+
+# ---------- 1) From your CST particles ----------
+# particles: list of dicts with at least {mass, position: (x,y,z), Ec}
+# If you have your existing classes, just export these arrays.
+masses   = jnp.array([p["mass"] for p in particles])            # [N]
+positions= jnp.array([p["pos"]  for p in particles])            # [N,3]
+Ec       = jnp.array([p["Ec"]   for p in particles])            # [N]
+
+N = masses.shape[0]
+
+# Choose binary spins or K-way categories:
+use_spins = True
+if use_spins:
+    nodes = [SpinNode() for _ in range(N)]
+else:
+    K = 8  # number of energy bins
+    nodes = [CategoricalNode() for _ in range(N)]
+
+# ---------- 2) Build gravitational edges ----------
+# Fully-connected is O(N^2); for scale use a radius cutoff or kNN.
+def pairwise_edges(pos, masses, G=6.67430e-11, scale=1e-3, eps=1e-3):
+    # returns edge list and weights for Ising-like pairwise term
+    ij = []
+    w  = []
+    for i in range(N):
+        for j in range(i+1, N):
+            r = jnp.linalg.norm(pos[i]-pos[j]) + eps
+            Jij = - G * masses[i] * masses[j] / r
+            # stabilize for Ising energy: scale & clip
+            Jij = jnp.clip(Jij * scale, -1.0, 1.0)
+            ij.append((i,j)); w.append(Jij)
+    return ij, jnp.array(w)
+
+edges, weights = pairwise_edges(positions, masses)
+
+# ---------- 3) External field (biases) from dark-matter + chaos ----------
+# Dark-matter via NFW profile (your doc): rho(r)=rho0/((r/rs)*(1+r/rs)^2)
+def nfw_bias_term(pos, rho0=1e-24, rs=1e21, G=6.67430e-11, scale=1e-3, eps=1e-3):
+    r = jnp.linalg.norm(pos, axis=1) + eps
+    rho = rho0/((r/rs)*(1.0+r/rs)**2)
+    # simple potential-like contribution (aligning with your DarkMatterInfluence)
+    u = -G * rho / r
+    return jnp.clip(u * scale, -1.0, 1.0)
+
+# Chaotic term: one Lorenz step; you can replace with your full ChaoticDynamics
+def lorenz_step(xyz, dt=1.0, sigma=10.0, r=28.0, b=8/3):
+    x,y,z = xyz
+    dx = sigma*(y-x); dy = x*(r-z)-y; dz = x*y - b*z
+    return (x+dx*dt, y+dy*dt, z+dz*dt)
+
+chaos = (0.0, 1.0, 1.05)
+chaos = lorenz_step(chaos, dt=1.0)
+chaos_drive = jnp.array(chaos[0])  # use x-dimension as in your Psi
+dm_term  = nfw_bias_term(positions)          # [N]
+biases   = jnp.clip(dm_term + 0.1*chaos_drive, -1.0, 1.0)  # [N]
+
+# ---------- 4) Build Ising EBM and sampler ----------
+# THRML expects arrays aligned with nodes/edges: see docs' IsingEBM/IsingSamplingProgram.
+# (edges list uses node objects, not indices)
+edge_nodes = [(nodes[i], nodes[j]) for (i,j) in edges]
+model = IsingEBM(nodes, edge_nodes, biases=biases, weights=weights, beta=jnp.array(1.0))  # β=1.0 for now
+# Blocks: two-color checkerboard (simple split) — adjust for your graph coloring
+free_blocks = [Block(nodes[::2]), Block(nodes[1::2])]
+program = IsingSamplingProgram(model, free_blocks, clamped_blocks=[])
+
+# Init and sample
+key = jax.random.key(0)
+k_init, k_samp = jax.random.split(key, 2)
+init_state = hinton_init(k_init, model, free_blocks, ())        # good default init
+schedule   = SamplingSchedule(n_warmup=100, n_samples=1000, steps_per_sample=2)
+samples    = sample_states(k_samp, program, schedule, init_state, [], [Block(nodes)])
+
+# 'samples' are the draws you can analyze or use to update CST parameters.
