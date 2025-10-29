@@ -1,0 +1,17 @@
+# Neighbor memory (average sampled state of neighbors):
+# Here we just demonstrate a simple bias update; swap in your exact memory vector.
+import numpy as np
+
+eta = 0.05  # learning rate
+adj = {i: [] for i in range(N)}
+for (i,j) in edges: adj[i].append(j); adj[j].append(i)
+
+# Convert the last batch of samples to numpy (shape: list of arrays per block)
+last_block_states = [np.array(arr) for arr in samples[-1]]  # demo; adapt to your usage
+# Reassemble per-node spins (bool/±1 depending on model); then compute neighbor means:
+node_vals = np.concatenate(last_block_states, axis=-1)[0]   # [nodes] for a single sample
+neighbor_mean = np.array([node_vals[adj[i]].mean() if adj[i] else 0.0 for i in range(N)])
+
+# Bias adaptation (CST memory -> bias):
+new_biases = (1-eta)*np.array(biases) + eta*neighbor_mean
+biases = jnp.array(np.clip(new_biases, -1.5, 1.5))
